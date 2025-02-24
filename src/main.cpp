@@ -2,114 +2,128 @@
 #include <U8g2lib.h>
 #include <TinyGPSPlus.h>
 #include <QMC5883LCompass.h>
+#include <ezButton.h>
+#include <RotaryEncoder.h>
 
+// Hardware Components
 TinyGPSPlus gps;
-HardwareSerial gpsSerial(2);  // Use UART2 for GPS (RX=16, TX=17)
+HardwareSerial gpsSerial(2);
 QMC5883LCompass compass;
-
-// Initialize U8g2 for SSD1106 (128x64 I2C Display)
 U8G2_SSD1306_128X64_NONAME_F_HW_I2C u8g2(U8G2_R0, /* reset=*/ U8X8_PIN_NONE);
 
-void setup() {
-    Serial.begin(115200);
+// Constants
+const int updateInterval = 500;
+unsigned long lastUpdate = 0;
 
-    Wire.begin();
+// Encoder Configuration
+#define ENCODER_CLK 25
+#define ENCODER_DT 26
+#define ENCODER_SW 27
+ezButton button(ENCODER_SW);
+
+int page = 0;
+int max_page = 3;
+
+void scanI2CDevices() {
     Serial.println("\nI2C Scanner");
     for (uint8_t address = 1; address < 127; address++) {
-      Wire.beginTransmission(address);
-      if (Wire.endTransmission() == 0) {
-        Serial.print("I2C device found at address 0x");
-        if (address < 16) {
-          Serial.print("0");
+        Wire.beginTransmission(address);
+        if (Wire.endTransmission() == 0) {
+            Serial.print("I2C device found at address 0x");
+            if (address < 16) Serial.print("0");
+            Serial.println(address, HEX);
         }
-        Serial.println(address, HEX);
-      }
     }
+}
 
-    // Initialize GPS
+void initGPS() {
     gpsSerial.begin(115200, SERIAL_8N1, 16, 17);  // GPS on UART2 (RX=16, TX=17)
+}
 
-    // Initialize Display
+void initCompass() {
+    compass.init();
+    compass.setMode(0x01, 0x0C, 0x10, 0x00); // Continuous, 200Hz, 8G, 512 (High Power)
+}
+
+void initDisplay() {
     u8g2.begin();
     u8g2.clearBuffer();
     u8g2.setFont(u8g2_font_6x12_tf);
+}
 
-    // Initialize Compass
-    compass.init();
-    compass.setMode(0x01, 0x0C, 0x10, 0x00); // Continuous, 200Hz, 8G, 512 (High Power)
+void setup() {
+    Serial.begin(115200);
+    Wire.begin();
+    
+    button.setDebounceTime(25);  // Configure Encoder button debounce
+    
+    scanI2CDevices();
+    initGPS();
+    initCompass();
+    initDisplay();
 
     delay(100);
 }
 
+
 String getCardinalDirection(float headingDegrees) {
-  // Array of directions
-  const char* directions[] = {
-    " N", " NNE", " NE", " ENE", " E", " ESE", " SE", " SSE", " S", " SSW", 
-    " SW", " WSW", " W", " WNW", " NW", " NNW"
-  };
-
-  // Array of ranges for each direction
-  float ranges[] = { 11.25, 33.75, 56.25, 78.75, 101.25, 123.75, 146.25, 168.75, 
-                     191.25, 213.75, 236.25, 258.75, 281.25, 303.75, 326.25, 348.75 };
-
-  // Determine the index of the cardinal direction
-  int index = 0;
-
-  // Special case for North (0-11.25 and 348.75-360)
-  if (headingDegrees < 11.25 || headingDegrees > 348.75) {
-    return directions[0]; // North
-  }
-
-  // Find the appropriate direction based on the headingDegrees
-  for (int i = 0; i < 16; i++) {
-    if (headingDegrees <= ranges[i]) {
-      index = i;
-      break;
+    const char* directions[] = { "N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+                                 "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW" };
+    float ranges[] = { 11.25, 33.75, 56.25, 78.75, 101.25, 123.75, 146.25, 168.75,
+                      191.25, 213.75, 236.25, 258.75, 281.25, 303.75, 326.25, 348.75 };
+    if (headingDegrees < 11.25 || headingDegrees > 348.75) return "N";
+    for (int i = 0; i < 16; i++) {
+        if (headingDegrees <= ranges[i]) return directions[i];
     }
-  }
-
-  return directions[index];
+    return "N"; 
 }
 
-void loop() {
-    // Read compass
-    int x, y, z;
-    String cardinal;
+void handleButtonPress() {
+    static unsigned long pressStartTime = 0;
+    button.loop();
     
-    compass.read();
-
-    x = compass.getX();
-    y = compass.getY();
-    z = compass.getZ();
-
-    float headingRadians = atan2(y, x);
-    float headingDegrees = headingRadians * 180 / PI;
-    float declinationAngle = -12.566666667; // NYC
-  
-    headingDegrees += declinationAngle;
-  
-    headingDegrees = fmod(headingDegrees + 360.0, 360.0); 
-
-    cardinal = getCardinalDirection(headingDegrees);
-
-    // Read GPS
-    while (gpsSerial.available()) {
-        gps.encode(gpsSerial.read());
+    if (button.isPressed()) {
+        pressStartTime = millis();
     }
 
-    // Display data on SSD1106 using U8g2
+    if (button.isReleased()) {
+        unsigned long pressDuration = millis() - pressStartTime;
+        if (pressDuration >= 1000) {
+            Serial.println("Long press detected!");
+        } else {
+            page = (page + 1) % (max_page + 1);
+            Serial.println(page);
+        }
+    }
+}
+
+void readCompass(float &headingDegrees, String &cardinal) {
+    compass.read();
+    int x = compass.getX();
+    int y = compass.getY();
+    int z = compass.getZ();
+    headingDegrees = atan2(y, x) * 180 / PI;
+    headingDegrees += -12.57;  // NYC declination
+    headingDegrees = fmod(headingDegrees + 360.0, 360.0);
+    cardinal = getCardinalDirection(headingDegrees);
+    Serial.printf("Heading: %.1f, Dir: %s, Mag: %.1f\n", headingDegrees, cardinal, sqrt(x * x + y * y + z * z));
+}
+
+void readGPS() {
+    while (gpsSerial.available()) {
+        gps.encode(gpsSerial.read());
+      }
+    Serial.printf("Time: %02d:%02d:%02d\n", gps.time.hour(), gps.time.minute(), gps.time.second());
+    Serial.printf("GPS - Lat: %.6f, Lon: %.6f, Sats: %d\n", gps.location.lat(), gps.location.lng(), gps.satellites.value());
+}
+
+void updateDisplay(float headingDegrees, String cardinal) {
     u8g2.clearBuffer();
-    
-    u8g2.setFont(u8g2_font_6x12_tf);
-    
-    // Heading Display
     u8g2.setCursor(10, 15);
     u8g2.print("Heading: ");
     u8g2.setCursor(60, 15);
     u8g2.print(headingDegrees);
-    //u8g2.print("°");
 
-    // GPS Time Display
     u8g2.setCursor(10, 25);
     if (gps.time.isValid()) {
         u8g2.printf("Time: %02d:%02d:%02d", gps.time.hour(), gps.time.minute(), gps.time.second());
@@ -117,7 +131,6 @@ void loop() {
         u8g2.print("No GPS Fix");
     }
 
-    // GPS Location Display
     u8g2.setCursor(10, 50);
     if (gps.location.isUpdated()) {
         u8g2.printf("Lat: %.6f", gps.location.lat());
@@ -125,17 +138,26 @@ void loop() {
         u8g2.printf("Lon: %.6f", gps.location.lng());
     }
 
-    // GPS Satellites Display
     u8g2.setCursor(10, 35);
     u8g2.print("Sat: ");
     u8g2.print(gps.satellites.value());
 
-    u8g2.sendBuffer();  // Send data to the display
-
-    Serial.printf("Time: %02d:%02d:%02d\n", gps.time.hour(), gps.time.minute(), gps.time.second());
-    Serial.printf("GPS - Lat: %.6f, Lon: %.6f, Sats: %d\n", gps.location.lat(), gps.location.lng(), gps.satellites.value());
-    Serial.printf("Compass - Heading: %.1f°, Dir: %s, X: %d, Y: %d, Z: %d, Mag: %.1f\n\n", headingDegrees, cardinal, x, y, z, sqrt(x * x + y * y + z * z));
-
-    delay(500);
+    u8g2.sendBuffer();
 }
 
+void loop() {
+    handleButtonPress();
+
+    if (millis() - lastUpdate >= updateInterval) {
+        lastUpdate = millis();
+        
+        float headingDegrees;
+        String cardinal;
+        readCompass(headingDegrees, cardinal);
+        readGPS();
+        updateDisplay(headingDegrees, cardinal);
+        
+        Serial.println();
+    }
+
+}
